@@ -3,8 +3,6 @@ Core functionality for repo-to-text
 """
 
 import os
-import subprocess
-import platform
 from typing import Tuple, Optional, List, Dict, Any, Set
 from datetime import datetime, timezone
 from importlib.machinery import ModuleSpec
@@ -12,124 +10,147 @@ import logging
 import yaml # type: ignore
 import pathspec
 from pathspec import PathSpec
+from treelib import Tree
 
-from ..utils.utils import check_tree_command, is_ignored_path
+from ..utils.utils import is_ignored_path
 
 def get_tree_structure(
         path: str = '.',
         gitignore_spec: Optional[PathSpec] = None,
         tree_and_content_ignore_spec: Optional[PathSpec] = None
     ) -> str:
-    """Generate tree structure of the directory."""
-    if not check_tree_command():
-        return ""
-
+    """Generate tree structure of the directory using treelib."""
     logging.debug('Generating tree structure for path: %s', path)
-    tree_output = run_tree_command(path)
+
+    abs_path = os.path.abspath(path)
+    tree = Tree()
+
+    # Collect all files first to determine which directories are non-empty
+    files_to_include: List[str] = []
+
+    for root, dirs, files in os.walk(abs_path):
+        # Filter out hidden directories that should be ignored
+        dirs[:] = [d for d in dirs if not _should_skip_dir(
+            os.path.join(root, d), abs_path, gitignore_spec, tree_and_content_ignore_spec
+        )]
+
+        for filename in files:
+            file_path = os.path.join(root, filename)
+            relative_path = os.path.relpath(file_path, abs_path).replace(os.sep, '/')
+
+            if not should_ignore_file(
+                file_path,
+                relative_path,
+                gitignore_spec,
+                None,
+                tree_and_content_ignore_spec
+            ):
+                files_to_include.append(relative_path)
+
+    # Build set of non-empty directories
+    non_empty_dirs: Set[str] = set()
+    for file_path in files_to_include:
+        dir_path = os.path.dirname(file_path)
+        while dir_path:
+            non_empty_dirs.add(dir_path)
+            dir_path = os.path.dirname(dir_path)
+
+    # Build the tree structure
+    tree.create_node('.', '.')
+
+    # Add directories first (only non-empty ones)
+    added_nodes: Set[str] = {'.'}
+    for dir_path in sorted(non_empty_dirs):
+        _add_path_to_tree(tree, dir_path, added_nodes, is_dir=True)
+
+    # Add files
+    for file_path in sorted(files_to_include):
+        _add_path_to_tree(tree, file_path, added_nodes, is_dir=False)
+
+    # Generate tree output
+    tree_output = _format_tree_output(tree)
     logging.debug('Tree output generated:\n%s', tree_output)
+    return tree_output
 
-    if not gitignore_spec and not tree_and_content_ignore_spec:
-        logging.debug('No .gitignore or ignore-tree-and-content specification found')
-        return tree_output
 
-    logging.debug('Filtering tree output based on ignore specifications')
-    return filter_tree_output(tree_output, path, gitignore_spec, tree_and_content_ignore_spec)
-
-def run_tree_command(path: str) -> str:
-    """Run the tree command and return its output."""
-    if platform.system() == "Windows":
-        cmd = ["cmd", "/c", "tree", "/a", "/f", path]
-    else:
-        cmd = ["tree", "-a", "-f", "--noreport", path]
-    
-    result = subprocess.run(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        encoding='utf-8',
-        check=True
-    )
-    return result.stdout
-
-def filter_tree_output(
-        tree_output: str,
-        path: str,
+def _should_skip_dir(
+        dir_path: str,
+        base_path: str,
         gitignore_spec: Optional[PathSpec],
         tree_and_content_ignore_spec: Optional[PathSpec]
-    ) -> str:
-    """Filter the tree output based on ignore specifications."""
-    lines: List[str] = tree_output.splitlines()
-    non_empty_dirs: Set[str] = set()
-
-    filtered_lines = [
-        process_line(line, path, gitignore_spec, tree_and_content_ignore_spec, non_empty_dirs)
-        for line in lines
-    ]
-
-    filtered_tree_output = '\n'.join(filter(None, filtered_lines))
-    logging.debug('Filtered tree structure:\n%s', filtered_tree_output)
-    return filtered_tree_output
-
-def process_line(
-        line: str,
-        path: str,
-        gitignore_spec: Optional[PathSpec],
-        tree_and_content_ignore_spec: Optional[PathSpec],
-        non_empty_dirs: Set[str]
-    ) -> Optional[str]:
-    """Process a single line of the tree output."""
-    full_path = extract_full_path(line, path)
-    if not full_path or full_path == '.':
-        return None
-
-    try:
-        relative_path = os.path.relpath(full_path, path).replace(os.sep, '/')
-    except (ValueError, OSError) as e:
-        # Handle case where relpath fails (e.g., in CI when cwd is unavailable)
-        # Use absolute path conversion as fallback
-        logging.debug('os.path.relpath failed for %s, using fallback: %s', full_path, e)
-        if os.path.isabs(full_path) and os.path.isabs(path):
-            # Both are absolute, try manual relative calculation
-            try:
-                common = os.path.commonpath([full_path, path])
-                relative_path = os.path.relpath(full_path, common).replace(os.sep, '/')
-            except (ValueError, OSError):
-                # Last resort: use just the filename
-                relative_path = os.path.basename(full_path)
-        else:
-            relative_path = os.path.basename(full_path)
-
-    if should_ignore_file(
-        full_path,
+    ) -> bool:
+    """Check if a directory should be skipped during traversal."""
+    relative_path = os.path.relpath(dir_path, base_path).replace(os.sep, '/')
+    return should_ignore_file(
+        dir_path,
         relative_path,
         gitignore_spec,
         None,
         tree_and_content_ignore_spec
-    ):
-        logging.debug('Ignored: %s', relative_path)
-        return None
+    )
 
-    if not os.path.isdir(full_path):
-        mark_non_empty_dirs(relative_path, non_empty_dirs)
 
-    if not os.path.isdir(full_path) or os.path.dirname(relative_path) in non_empty_dirs:
-        return line.replace('./', '', 1)
-    return None
+def _add_path_to_tree(
+        tree: Tree,
+        path: str,
+        added_nodes: Set[str],
+        is_dir: bool
+    ) -> None:
+    """Add a path to the tree, creating parent nodes as needed."""
+    if path in added_nodes:
+        return
 
-def extract_full_path(line: str, path: str) -> Optional[str]:
-    """Extract the full path from a line of tree output."""
-    idx = line.find('./')
-    if idx == -1:
-        idx = line.find(path)
-    return line[idx:].strip() if idx != -1 else None
+    parts = path.split('/')
+    current_path = ''
 
-def mark_non_empty_dirs(relative_path: str, non_empty_dirs: Set[str]) -> None:
-    """Mark all parent directories of a file as non-empty."""
-    dir_path = os.path.dirname(relative_path)
-    while dir_path:
-        non_empty_dirs.add(dir_path)
-        dir_path = os.path.dirname(dir_path)
+    for i, part in enumerate(parts):
+        parent_path = current_path if current_path else '.'
+        current_path = '/'.join(parts[:i + 1])
+
+        if current_path not in added_nodes:
+            tree.create_node(part, current_path, parent=parent_path)
+            added_nodes.add(current_path)
+
+
+def _format_tree_output(tree: Tree) -> str:
+    """Format the tree output to match traditional tree command style."""
+    lines: List[str] = []
+    _format_node(tree, '.', '', lines, is_last=True, is_root=True)
+    return '\n'.join(lines[1:]) if len(lines) > 1 else ''  # Skip root '.' line
+
+
+def _format_node(
+        tree: Tree,
+        node_id: str,
+        prefix: str,
+        lines: List[str],
+        is_last: bool,
+        is_root: bool = False
+    ) -> None:
+    """Recursively format a node and its children."""
+    node = tree.get_node(node_id)
+    if node is None:
+        return
+
+    if is_root:
+        lines.append(node.tag)
+    else:
+        connector = '└── ' if is_last else '├── '
+        lines.append(prefix + connector + node.tag)
+
+    children = tree.children(node_id)
+    # Sort children: directories first, then files, both alphabetically
+    dirs = sorted([c for c in children if tree.children(c.identifier)], key=lambda x: x.tag.lower())
+    files = sorted([c for c in children if not tree.children(c.identifier)], key=lambda x: x.tag.lower())
+    sorted_children = dirs + files
+
+    for i, child in enumerate(sorted_children):
+        is_child_last = (i == len(sorted_children) - 1)
+        if is_root:
+            child_prefix = ''
+        else:
+            child_prefix = prefix + ('    ' if is_last else '│   ')
+        _format_node(tree, child.identifier, child_prefix, lines, is_child_last)
 
 def load_ignore_specs(
         path: str = '.',

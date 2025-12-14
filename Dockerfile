@@ -8,11 +8,6 @@ ENV PYTHONUNBUFFERED=1 \
 # Create non-root user
 RUN useradd -m -s /bin/bash user
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    tree \
-    && rm -rf /var/lib/apt/lists/*
-
 WORKDIR /app
 
 # Copy all necessary files for package installation
